@@ -114,8 +114,10 @@ class StrategyEngine:
         return None
 
     def atr(self):
+        if not self.bars:
+            return None
         a = self._atr_series()
-        return a[-1]
+        return a[-1] if a else None
 
     # ---------- 入场/出场状态 ----------
     def mark_entry(self, price):

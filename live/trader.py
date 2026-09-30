@@ -52,8 +52,6 @@ def fetch_history(client, inst_id, bar, need):
             break
         raw.extend(d)
         after = d[-1][0]
-        if len(d) < 300:
-            break
     raw = raw[::-1]  # 升序
     bars = [Bar(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in raw]
     return bars
@@ -97,6 +95,7 @@ class Trader:
         self.sim_entry = 0.0
         self.inst_info = None
         self.entry_order_id = None
+        self.hedge = False          # 账户是否多空双向持仓(long_short_mode)
         self.mailer = Mailer(log=log)
         self._trades = []          # 当日/运行期成交记录
         self._summary_sent = None
@@ -154,8 +153,9 @@ class Trader:
                     log("仓位算出来是 0(资金不足/低于最小张数), 跳过")
                     return
                 side = "buy" if signal == "L" else "sell"
+                pos_side = ("long" if signal == "L" else "short") if self.hedge else None
                 r = self.client.place_order(self.inst, side, "limit", sz,
-                                            td_mode=self.cfg["td_mode"], px=price)
+                                            td_mode=self.cfg["td_mode"], pos_side=pos_side, px=price)
             log("[live] 开仓 %s @ %.1f sz=%s -> %s" % (signal, price, sz, r))
             self.eng.enter(signal, price)
             self.notify_entry(signal, price, sz)
@@ -206,8 +206,10 @@ class Trader:
             for p in live:
                 side_p = float(p["pos"])
                 close_side = "sell" if side_p > 0 else "buy"
+                pos_side = p.get("posSide") if self.hedge else None
                 r = self.client.place_order(self.inst, close_side, "market", abs(side_p),
-                                            td_mode=self.cfg["td_mode"], reduce_only=True)
+                                            td_mode=self.cfg["td_mode"], pos_side=pos_side,
+                                            reduce_only=True)
                 log("[live] 平仓 sz=%s -> %s" % (abs(side_p), r))
             self.notify_exit(price, "移动止损")
             self.eng.flat()
@@ -220,6 +222,14 @@ class Trader:
     def warmup(self):
         if self.inst_type == "SWAP":
             self.inst_info = self.client.instrument("SWAP", self.inst)
+            if not self.dry:
+                try:
+                    self.hedge = self.client.account_config().get("posMode") == "long_short_mode"
+                    self.client.set_leverage(self.inst, self.cfg["leverage"], self.cfg["td_mode"])
+                    log("账户持仓模式: %s | 杠杆已设为 %sx" % (
+                        "多空双向" if self.hedge else "净持仓", self.cfg["leverage"]))
+                except OKXError as e:
+                    log("账户配置获取/设杠杆失败(继续): %s" % e)
         need = self.cfg["warmup_bars"] * 2  # 10m -> 5m
         bars5 = fetch_history(self.client, self.inst, self.cfg["bar"], need)
         agg = aggregate(bars5, self.cfg["tf_min"])

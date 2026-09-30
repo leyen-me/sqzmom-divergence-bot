@@ -129,3 +129,17 @@ class OKXClient:
 
     def order_status(self, inst_id, ord_id):
         return self._request("GET", "/api/v5/trade/order", {"instId": inst_id, "ordId": ord_id}, signed=True)
+
+    def cancel_order(self, inst_id, ord_id=None, cl_ord_id=None):
+        body = {"instId": inst_id}
+        if ord_id:
+            body["ordId"] = ord_id
+        if cl_ord_id:
+            body["clOrdId"] = cl_ord_id
+        return self._request("POST", "/api/v5/trade/cancel-order", body=body, signed=True)
+
+    def pending_orders(self, inst_id):
+        return self._request("GET", "/api/v5/trade/orders-pending", {"instId": inst_id}, signed=True)
+
+    def account_config(self):
+        return self._request("GET", "/api/v5/account/config", signed=True)[0]
