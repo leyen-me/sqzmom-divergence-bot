@@ -240,17 +240,28 @@ class Trader:
                 side = "buy" if signal == "L" else "sell"
                 pos_side = ("long" if signal == "L" else "short") if self.hedge else None
                 td_mode = self.cfg["td_mode"]
-            ack = self.client.place_order(self.inst, side, "limit", sz, td_mode=td_mode,
-                                          pos_side=pos_side, px=price)
+            ord_type = self.cfg.get("entry_order_type", "limit")
+            if ord_type == "market":
+                ack = self.client.place_order(self.inst, side, "market", sz, td_mode=td_mode,
+                                              pos_side=pos_side)
+                log("[live] 市价开仓 %s sz=%s ordId=%s" % (signal, sz, ack.get("ordId")))
+            else:
+                # 限价: 默认挂现价; entry_offset_ticks>0 时挂对手价(更易成交, 可能吃单)
+                off = self.cfg.get("entry_offset_ticks", 0) * (float(self.inst_info["tickSz"])
+                                                               if self.inst_info else 0.1)
+                px = price + off if signal == "L" else price - off
+                px = self._round_tick(px)
+                ack = self.client.place_order(self.inst, side, "limit", sz, td_mode=td_mode,
+                                              pos_side=pos_side, px=px)
+                log("[live] 限价挂单 %s @ %.1f sz=%s ordId=%s" % (signal, px, sz, ack.get("ordId")))
             oid = ack["ordId"]
-            log("[live] 挂单 %s @ %.1f sz=%s ordId=%s" % (signal, price, sz, oid))
             fill_px, fill_sz, st = self._wait_fill(oid, timeout=self.cfg.get("entry_timeout_sec", 20))
-            if st != "filled":
+            if ord_type != "market" and st != "filled":
                 # 未完全成交: 撤掉剩余, 有部分成交则按部分建仓
                 self.client.cancel_order(self.inst, ord_id=oid)
             if fill_sz <= 0:
-                log("[live] 限价单未成交, 已撤销, 放弃本次信号")
-                self.mailer.send("[OKX] 限价单未成交, 信号放弃",
+                log("[live] %s 未成交, 放弃本次信号" % ord_type)
+                self.mailer.send("[OKX] %s 未成交, 信号放弃" % ord_type,
                                  "%s @ %.1f\n状态=%s" % (signal, price, st))
                 return
             if st != "filled":
