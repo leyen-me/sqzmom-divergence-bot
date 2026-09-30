@@ -126,6 +126,20 @@ class Trader:
         return round(notional / price, 8)
 
     # ---------- 下单 ----------
+    def _wait_fill(self, oid, timeout=20):
+        """轮询限价单, 返回 (成交均价, 已成交数量, 状态)。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            o = self.client.order_status(self.inst, oid)
+            if o:
+                st = o.get("state")
+                fs = float(o.get("accFillSz") or 0)
+                if st in ("filled", "canceled"):
+                    return float(o.get("avgPx") or 0), fs, st
+            time.sleep(1.0)
+        o = self.client.order_status(self.inst, oid) or {}
+        return float(o.get("avgPx") or 0), float(o.get("accFillSz") or 0), o.get("state", "unknown")
+
     def open_position(self, signal, price):
         if self.dry:
             sz = (self.spot_size(price) if self.inst_type == "SPOT" else self.size_contracts(price))
@@ -145,8 +159,8 @@ class Trader:
                     log("现货不支持做空, 忽略 S 信号")
                     return
                 sz = self.spot_size(price)
-                r = self.client.place_order(self.inst, "buy", "limit", sz,
-                                            td_mode="cash", px=price)
+                td_mode, pos_side = "cash", None
+                side = "buy"
             else:
                 sz = self.size_contracts(price)
                 if sz <= 0:
@@ -154,11 +168,24 @@ class Trader:
                     return
                 side = "buy" if signal == "L" else "sell"
                 pos_side = ("long" if signal == "L" else "short") if self.hedge else None
-                r = self.client.place_order(self.inst, side, "limit", sz,
-                                            td_mode=self.cfg["td_mode"], pos_side=pos_side, px=price)
-            log("[live] 开仓 %s @ %.1f sz=%s -> %s" % (signal, price, sz, r))
-            self.eng.enter(signal, price)
-            self.notify_entry(signal, price, sz)
+                td_mode = self.cfg["td_mode"]
+            ack = self.client.place_order(self.inst, side, "limit", sz, td_mode=td_mode,
+                                          pos_side=pos_side, px=price)
+            oid = ack["ordId"]
+            log("[live] 挂单 %s @ %.1f sz=%s ordId=%s" % (signal, price, sz, oid))
+            fill_px, fill_sz, st = self._wait_fill(oid, timeout=self.cfg.get("entry_timeout_sec", 20))
+            if st != "filled":
+                # 未完全成交: 撤掉剩余, 有部分成交则按部分建仓
+                self.client.cancel_order(self.inst, ord_id=oid)
+            if fill_sz <= 0:
+                log("[live] 限价单未成交, 已撤销, 放弃本次信号")
+                self.mailer.send("[OKX] 限价单未成交, 信号放弃",
+                                 "%s @ %.1f\n状态=%s" % (signal, price, st))
+                return
+            if st != "filled":
+                log("[live] 部分成交 %s/%s" % (fill_sz, sz))
+            self.eng.enter(signal, fill_px or price)
+            self.notify_entry(signal, fill_px or price, fill_sz)
         except OKXError as e:
             log("开仓失败: %s" % e)
             self.mailer.send("[OKX][异常] 开仓失败", "%s\n价格=%.1f\n%s" % (signal, price, e))
@@ -175,7 +202,7 @@ class Trader:
             "模式: %s | 杠杆: %s\n时间: %s UTC" % (
                 side, self.inst, sz, price, stop or 0, self.eng.atr_ref or 0,
                 "模拟盘" if self.dry else "实盘", self.cfg["leverage"],
-                time.strftime("%Y-%m-%d %H:%M:%S")))
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
 
     def notify_exit(self, price, reason):
         info = getattr(self, "_open_info", None) or {}
@@ -188,7 +215,7 @@ class Trader:
             "标的: %s\n入场: %.1f -> 出场: %.1f (%+.2f%%)\n止损原因: %s\n"
             "模式: %s\n时间: %s UTC" % (
                 self.inst, entry, price, chg, reason,
-                "模拟盘" if self.dry else "实盘", time.strftime("%Y-%m-%d %H:%M:%S")))
+                "模拟盘" if self.dry else "实盘", time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
         self._open_info = None
 
     def close_position(self, price):
@@ -207,10 +234,21 @@ class Trader:
                 side_p = float(p["pos"])
                 close_side = "sell" if side_p > 0 else "buy"
                 pos_side = p.get("posSide") if self.hedge else None
-                r = self.client.place_order(self.inst, close_side, "market", abs(side_p),
-                                            td_mode=self.cfg["td_mode"], pos_side=pos_side,
-                                            reduce_only=True)
-                log("[live] 平仓 sz=%s -> %s" % (abs(side_p), r))
+                ack = self.client.place_order(self.inst, close_side, "market", abs(side_p),
+                                              td_mode=self.cfg["td_mode"], pos_side=pos_side,
+                                              reduce_only=True)
+                log("[live] 平仓 sz=%s ordId=%s" % (abs(side_p), ack.get("ordId")))
+            time.sleep(1.0)
+            remain = [p for p in self.client.positions(self.inst) if abs(float(p.get("pos", 0))) > 0]
+            if remain:
+                log("平仓后仍有持仓, 保留状态下一轮重试")
+                if not getattr(self, "_close_alerted", False):
+                    self._close_alerted = True
+                    self.mailer.send("[OKX][紧急] 平仓未完成",
+                                     "价格=%.1f\n剩余持仓: %s\n请检查!" % (
+                                         price, [(p.get("posSide"), p.get("pos")) for p in remain]))
+                return
+            self._close_alerted = False
             self.notify_exit(price, "移动止损")
             self.eng.flat()
         except OKXError as e:
@@ -230,9 +268,9 @@ class Trader:
                         "多空双向" if self.hedge else "净持仓", self.cfg["leverage"]))
                 except OKXError as e:
                     log("账户配置获取/设杠杆失败(继续): %s" % e)
-        need = self.cfg["warmup_bars"] * 2  # 10m -> 5m
-        bars5 = fetch_history(self.client, self.inst, self.cfg["bar"], need)
-        agg = aggregate(bars5, self.cfg["tf_min"])
+        need = self.cfg["warmup_bars"] + 60   # 多取一点保证指标预热
+        raw = fetch_history(self.client, self.inst, self.cfg["bar"], need)
+        agg = aggregate(raw, self.cfg["tf_min"])
         fed = 0
         for b, closed in agg[:-1]:
             if closed:
@@ -241,6 +279,28 @@ class Trader:
                 fed += 1
         log("warmup: 喂入 %d 根 %dm K线, 当前价 %.1f, ATR=%.2f" %
             (fed, self.cfg["tf_min"], self.price(), self.eng.atr() or 0))
+        self.reconcile()
+
+    def reconcile(self):
+        """启动时核对交易所已有持仓, 有则接管(否则旧仓无人管理)。"""
+        if self.dry:
+            return
+        try:
+            live = [p for p in self.client.positions(self.inst) if abs(float(p.get("pos", 0))) > 0]
+        except OKXError as e:
+            log("核对持仓失败: %s" % e)
+            return
+        if not live:
+            log("启动核对: 当前无持仓")
+            return
+        p = live[0]
+        q = float(p["pos"]); entry = float(p.get("avgPx") or 0)
+        sig = "L" if q > 0 else "S"
+        self.eng.enter(sig, entry)         # atr_ref = 当前ATR, best=entry, 从当前价继续管理
+        log("启动核对: 接管已有持仓 %s 数量=%s 均价=%.1f" % (sig, q, entry))
+        self.mailer.send("[OKX] 接管已有持仓",
+                         "方向=%s 数量=%s 均价=%.1f\n已按当前ATR继续移动止损管理\n时间=%s UTC" % (
+                             sig, q, entry, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
 
     def loop(self):
         log("启动 trader | inst=%s demo=%s dry_run=%s lev=%s qty=%s" %
@@ -252,7 +312,7 @@ class Trader:
                 self.inst, "模拟盘" if self.dry else "实盘", self.cfg["leverage"],
                 self.cfg["qty_pct"] * 100, self.cfg["length_kc"], self.cfg["lb"],
                 self.cfg["atr_len"], self.cfg["sl_atr"], self.cfg["trail_atr"],
-                time.strftime("%Y-%m-%d %H:%M:%S")))
+                time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
         max_iter = int(os.environ.get("MAX_ITER", "0")) or None
         it = 0
         while True:
@@ -261,8 +321,8 @@ class Trader:
                 log("达到 MAX_ITER=%d, 退出" % max_iter)
                 break
             try:
-                bars5 = fetch_history(self.client, self.inst, self.cfg["bar"], 60)
-                agg = aggregate(bars5, self.cfg["tf_min"])
+                raw = fetch_history(self.client, self.inst, self.cfg["bar"], 60)
+                agg = aggregate(raw, self.cfg["tf_min"])
                 # 只处理已收盘且未处理过的 bar
                 for b, closed in agg:
                     if not closed or b.ts <= self.last_bar_ts:

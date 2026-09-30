@@ -1,13 +1,14 @@
 {
   "instId": "BTC-USDT-SWAP",
-  "bar": "5m",
-  "tf_min": 10,
+  "bar": "1m",
+  "tf_min": 1,
   "leverage": 3,
   "qty_pct": 0.8,
   "td_mode": "cross",
-  "poll_sec": 5,
+  "poll_sec": 2,
   "dry_run": true,
-  "warmup_bars": 120,
+  "warmup_bars": 300,
+  "entry_timeout_sec": 20,
   "_sim_equity": 10000.0,
 
   "length_kc": 20,

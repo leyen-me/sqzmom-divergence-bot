@@ -50,32 +50,43 @@ class OKXClient:
             h["x-simulated-trading"] = "1"
         return h
 
-    def _request(self, method, path, params=None, body=None, signed=False, tries=5):
+    # OKX 认为"可稍后重试"的顶层错误码
+    RETRYABLE = ("50011", "50013", "50026", "50004", "50061")
+
+    def _request(self, method, path, params=None, body=None, signed=False,
+                 tries=5, retry=True):
+        """retry=False 时只请求一次(用于下单等非幂等操作, 避免重复成交)。"""
         params = params or {}
         qs = ("?" + urllib.parse.urlencode(params)) if params else ""
         full = path + qs
         data = json.dumps(body) if body is not None else ""
         url = BASE + full
+        attempts = tries if retry else 1
         last = None
-        for i in range(tries):
+        for i in range(attempts):
             try:
                 req = urllib.request.Request(
                     url, data=data.encode() if data else None, method=method,
                     headers=self._headers(method, full, data))
                 with urllib.request.urlopen(req, timeout=20) as r:
                     d = json.loads(r.read())
-                if d.get("code") == "0":
-                    return d["data"]
-                last = d.get("code") + " " + d.get("msg", "")
-                if d.get("code") in ("50011", "50013", "50026"):  # 限速/系统忙
-                    time.sleep(0.5 * (i + 1)); continue
-                raise OKXError(last)
             except urllib.error.HTTPError as e:
                 last = "HTTP %s %s" % (e.code, e.read()[:200])
                 time.sleep(0.5 * (i + 1))
+                continue
             except Exception as e:
                 last = str(e)
                 time.sleep(0.5 * (i + 1))
+                continue
+            # 拿到响应(不再被 except 吞掉业务错误)
+            code = d.get("code")
+            if code == "0":
+                return d["data"]
+            last = "%s %s" % (code, d.get("msg", ""))
+            if retry and code in self.RETRYABLE:
+                time.sleep(0.5 * (i + 1))
+                continue
+            raise OKXError(last)
         raise OKXError("request failed: %s %s" % (full, last))
 
     # ---------- 公共 ----------
@@ -116,6 +127,7 @@ class OKXClient:
 
     def place_order(self, inst_id, side, ord_type, sz, td_mode="cross", pos_side=None,
                     px=None, reduce_only=None, cl_ord_id=None):
+        """下单。成功返回 ack dict(含 ordId); 被拒抛 OKXError。不自动重试(防重复)。"""
         body = {"instId": inst_id, "tdMode": td_mode, "side": side, "ordType": ord_type, "sz": str(sz)}
         if pos_side:
             body["posSide"] = pos_side
@@ -125,10 +137,15 @@ class OKXClient:
             body["reduceOnly"] = "true"
         if cl_ord_id:
             body["clOrdId"] = cl_ord_id
-        return self._request("POST", "/api/v5/trade/order", body=body, signed=True)
+        data = self._request("POST", "/api/v5/trade/order", body=body, signed=True, retry=False)
+        r = data[0]
+        if r.get("sCode") not in (None, "0", ""):
+            raise OKXError("下单被拒 sCode=%s %s" % (r.get("sCode"), r.get("sMsg")))
+        return r
 
     def order_status(self, inst_id, ord_id):
-        return self._request("GET", "/api/v5/trade/order", {"instId": inst_id, "ordId": ord_id}, signed=True)
+        d = self._request("GET", "/api/v5/trade/order", {"instId": inst_id, "ordId": ord_id}, signed=True)
+        return d[0] if d else None
 
     def cancel_order(self, inst_id, ord_id=None, cl_ord_id=None):
         body = {"instId": inst_id}
@@ -136,7 +153,12 @@ class OKXClient:
             body["ordId"] = ord_id
         if cl_ord_id:
             body["clOrdId"] = cl_ord_id
-        return self._request("POST", "/api/v5/trade/cancel-order", body=body, signed=True)
+        data = self._request("POST", "/api/v5/trade/cancel-order", body=body, signed=True, retry=False)
+        r = data[0]
+        # 已成交/已撤的单撤单会报错, 视为"已不在挂单中", 不抛异常
+        if r.get("sCode") not in (None, "0", ""):
+            return {"ordId": ord_id, "sCode": r.get("sCode"), "sMsg": r.get("sMsg")}
+        return r
 
     def pending_orders(self, inst_id):
         return self._request("GET", "/api/v5/trade/orders-pending", {"instId": inst_id}, signed=True)

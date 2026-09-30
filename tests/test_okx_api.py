@@ -79,8 +79,8 @@ class TestPrivateAPI(unittest.TestCase):
         pos_side = ("long" if self.hedge else None)
         r = self.c.place_order(INST, "buy", "limit", sz, td_mode="cross",
                                pos_side=pos_side, px=far)
-        self.assertEqual(r[0]["sCode"], "0")
-        oid = r[0]["ordId"]
+        oid = r["ordId"]
+        self.assertTrue(oid)
         try:
             pend_ids = [p["ordId"] for p in self.c.pending_orders(INST)]
             self.assertIn(oid, pend_ids)
