@@ -5,7 +5,7 @@
   "leverage": 3,
   "qty_pct": 0.8,
   "td_mode": "cross",
-  "poll_sec": 2,
+  "poll_sec": 5,
   "dry_run": true,
   "warmup_bars": 300,
   "entry_timeout_sec": 20,

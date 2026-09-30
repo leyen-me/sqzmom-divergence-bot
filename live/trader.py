@@ -42,6 +42,12 @@ def load_config():
     return cfg
 
 
+def fetch_recent(client, inst_id, bar, n):
+    """取最近 n 根 K 线(升序返回 [Bar]), 用于主循环。"""
+    raw = client.candles_recent(inst_id, bar, limit=n)[::-1]
+    return [Bar(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in raw]
+
+
 def fetch_history(client, inst_id, bar, need):
     """取最近 need 根已收盘 K 线, 升序返回 [Bar]."""
     raw = []
@@ -99,6 +105,37 @@ class Trader:
         self.mailer = Mailer(log=log)
         self._trades = []          # 当日/运行期成交记录
         self._summary_sent = None
+        self.state_path = os.path.join(PROJ, "out", "state.json")
+        self.stop_algo = None       # 交易所侧保护性止损 algoId
+        self.stop_trigger = None    # 交易所侧止损当前触发价
+        self.pos_sz = 0.0           # 当前持仓数量(用于保护止损)
+
+    # ---------- 状态落盘 ----------
+    def load_state(self):
+        try:
+            with open(self.state_path) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_state(self):
+        st = {
+            "last_bar_ts": self.last_bar_ts,
+            "pos": self.eng.pos,
+            "entry_px": self.eng.entry_px,
+            "atr_ref": self.eng.atr_ref,
+            "best": self.eng.best,
+            "trail_on": self.eng.trail_on,
+            "stop_algo": self.stop_algo,
+        }
+        try:
+            os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
+            tmp = self.state_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.replace(tmp, self.state_path)
+        except Exception as e:
+            log("状态落盘失败: %s" % e)
 
     # ---------- 工具 ----------
     def price(self):
@@ -148,10 +185,12 @@ class Trader:
                 return
             self.sim_pos = sz if signal == "L" else -sz
             self.sim_entry = price
+            self.pos_sz = abs(sz)
             self.eng.enter(signal, price)
             log("[dry] 开仓 %s @ %.1f sz=%s atrRef=%.2f stop=%.1f" %
                 (signal, price, sz, self.eng.atr_ref, self.eng.stop_level()))
             self.notify_entry(signal, price, sz)
+            self.save_state()
             return
         try:
             if self.inst_type == "SPOT":
@@ -184,11 +223,49 @@ class Trader:
                 return
             if st != "filled":
                 log("[live] 部分成交 %s/%s" % (fill_sz, sz))
+            self.pos_sz = fill_sz
             self.eng.enter(signal, fill_px or price)
+            self.place_protective_stop()
             self.notify_entry(signal, fill_px or price, fill_sz)
+            self.save_state()
         except OKXError as e:
             log("开仓失败: %s" % e)
             self.mailer.send("[OKX][异常] 开仓失败", "%s\n价格=%.1f\n%s" % (signal, price, e))
+
+    # ---------- 交易所侧保护性止损 ----------
+    def _round_tick(self, px):
+        tick = float(self.inst_info["tickSz"]) if self.inst_info else 0.1
+        return round(px / tick) * tick
+
+    def place_protective_stop(self):
+        """开仓后在交易所挂硬止损条件单, 防止程序离线时裸奔。"""
+        if self.dry or self.inst_type != "SWAP" or self.eng.pos == 0 or self.pos_sz <= 0:
+            return
+        trig = self._round_tick(self.eng.stop_level())
+        side = "sell" if self.eng.pos > 0 else "buy"
+        pos_side = ("long" if self.eng.pos > 0 else "short") if self.hedge else None
+        try:
+            self.stop_algo = self.client.place_algo_stop(
+                self.inst, side, pos_side, self.pos_sz, trig, self.cfg["td_mode"])
+            self.stop_trigger = trig
+            log("[live] 已挂交易所保护止损 @ %.1f algoId=%s" % (trig, self.stop_algo))
+        except OKXError as e:
+            log("挂保护止损失败: %s" % e)
+            self.mailer.send("[OKX][异常] 交易所保护止损挂单失败",
+                             "止损价=%.1f 数量=%s\n%s\n仓位未受交易所侧保护!" % (trig, self.pos_sz, e))
+
+    def sync_protective_stop(self):
+        """移动止损激活后, 把交易所侧止损同步上移(差额 > 0.1ATR 才重挂)。"""
+        if self.dry or self.inst_type != "SWAP" or self.eng.pos == 0 or self.pos_sz <= 0:
+            return
+        if not self.eng.trail_on:
+            return
+        trig = self._round_tick(self.eng.stop_level())
+        if self.stop_algo and self.stop_trigger is not None \
+                and abs(trig - self.stop_trigger) < 0.1 * self.eng.atr_ref:
+            return
+        self.client.cancel_algo(self.inst, self.stop_algo)
+        self.place_protective_stop()
 
     def notify_entry(self, signal, price, sz):
         side = "做多 LONG" if signal == "L" else "做空 SHORT"
@@ -227,17 +304,25 @@ class Trader:
             self.sim_pos = 0.0
             self.eng.flat()
             return
+        # 先撤交易所侧保护止损, 避免残留/重复触发
+        self.client.cancel_algo(self.inst, self.stop_algo)
+        self.stop_algo = None; self.stop_trigger = None
         try:
-            pos = self.client.positions(self.inst)
-            live = [p for p in pos if abs(float(p.get("pos", 0))) > 0]
+            live = [p for p in self.client.positions(self.inst) if abs(float(p.get("pos", 0))) > 0]
+            close_oids = []
             for p in live:
                 side_p = float(p["pos"])
                 close_side = "sell" if side_p > 0 else "buy"
                 pos_side = p.get("posSide") if self.hedge else None
-                ack = self.client.place_order(self.inst, close_side, "market", abs(side_p),
-                                              td_mode=self.cfg["td_mode"], pos_side=pos_side,
-                                              reduce_only=True)
-                log("[live] 平仓 sz=%s ordId=%s" % (abs(side_p), ack.get("ordId")))
+                try:
+                    ack = self.client.place_order(self.inst, close_side, "market", abs(side_p),
+                                                  td_mode=self.cfg["td_mode"], pos_side=pos_side,
+                                                  reduce_only=True)
+                    close_oids.append(ack.get("ordId"))
+                    log("[live] 平仓 sz=%s ordId=%s" % (abs(side_p), ack.get("ordId")))
+                except OKXError as e:
+                    # 可能已被交易所侧止损平掉/或重复平仓, 稍后复查持仓为准
+                    log("平仓下单异常(将复查持仓): %s" % e)
             time.sleep(1.0)
             remain = [p for p in self.client.positions(self.inst) if abs(float(p.get("pos", 0))) > 0]
             if remain:
@@ -249,8 +334,16 @@ class Trader:
                                          price, [(p.get("posSide"), p.get("pos")) for p in remain]))
                 return
             self._close_alerted = False
-            self.notify_exit(price, "移动止损")
+            # 用真实成交均价记账/通知
+            exit_px = price
+            for oid in close_oids:
+                o = self.client.order_status(self.inst, oid)
+                if o and float(o.get("avgPx") or 0) > 0:
+                    exit_px = float(o["avgPx"])
+            self.pos_sz = 0.0
+            self.notify_exit(exit_px, "移动止损")
             self.eng.flat()
+            self.save_state()
         except OKXError as e:
             log("平仓失败: %s" % e)
             self.mailer.send("[OKX][紧急] 平仓失败, 请人工处理",
@@ -282,7 +375,7 @@ class Trader:
         self.reconcile()
 
     def reconcile(self):
-        """启动时核对交易所已有持仓, 有则接管(否则旧仓无人管理)。"""
+        """启动时核对交易所持仓, 有则接管; 优先用落盘状态精确恢复。"""
         if self.dry:
             return
         try:
@@ -290,17 +383,40 @@ class Trader:
         except OKXError as e:
             log("核对持仓失败: %s" % e)
             return
+        saved = self.load_state()
         if not live:
-            log("启动核对: 当前无持仓")
+            if saved.get("pos"):
+                log("启动核对: 状态记录有仓但交易所无仓, 以交易所为准清空状态")
+            else:
+                log("启动核对: 当前无持仓")
+            self.eng.flat()
+            self.stop_algo = None
+            self.save_state()
             return
         p = live[0]
         q = float(p["pos"]); entry = float(p.get("avgPx") or 0)
-        sig = "L" if q > 0 else "S"
-        self.eng.enter(sig, entry)         # atr_ref = 当前ATR, best=entry, 从当前价继续管理
-        log("启动核对: 接管已有持仓 %s 数量=%s 均价=%.1f" % (sig, q, entry))
-        self.mailer.send("[OKX] 接管已有持仓",
-                         "方向=%s 数量=%s 均价=%.1f\n已按当前ATR继续移动止损管理\n时间=%s UTC" % (
-                             sig, q, entry, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
+        self.pos_sz = abs(q)
+        sig = 1 if q > 0 else -1
+        if saved.get("pos") == sig and saved.get("entry_px"):
+            # 精确恢复(保住 best/trail_on, 移动止损不倒退)
+            self.eng.pos = sig
+            self.eng.pos_signal = sig
+            self.eng.entry_px = saved["entry_px"]
+            self.eng.atr_ref = saved["atr_ref"]
+            self.eng.best = saved["best"]
+            self.eng.trail_on = saved["trail_on"]
+            self.stop_algo = saved.get("stop_algo")
+            log("启动核对: 按落盘状态恢复持仓 %+d 数量=%s (entry=%.1f best=%.1f trail=%s)" % (
+                sig, q, self.eng.entry_px, self.eng.best, self.eng.trail_on))
+        else:
+            self.eng.enter("L" if sig > 0 else "S", entry)
+            log("启动核对: 无落盘状态, 按均价接管持仓 %+d 数量=%s 均价=%.1f" % (sig, q, entry))
+        self.mailer.send("[OKX] 启动接管持仓",
+                         "方向=%+d 数量=%s 均价=%.1f\nATR=%.2f best=%.1f trail_on=%s\n时间=%s UTC" % (
+                             sig, q, entry, self.eng.atr_ref, self.eng.best, self.eng.trail_on,
+                             time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
+        self.place_protective_stop()
+        self.save_state()
 
     def loop(self):
         log("启动 trader | inst=%s demo=%s dry_run=%s lev=%s qty=%s" %
@@ -321,7 +437,7 @@ class Trader:
                 log("达到 MAX_ITER=%d, 退出" % max_iter)
                 break
             try:
-                raw = fetch_history(self.client, self.inst, self.cfg["bar"], 60)
+                raw = fetch_recent(self.client, self.inst, self.cfg["bar"], 30)
                 agg = aggregate(raw, self.cfg["tf_min"])
                 # 只处理已收盘且未处理过的 bar
                 for b, closed in agg:
@@ -337,16 +453,35 @@ class Trader:
                 # 盘中止损检查
                 px = self.price()
                 if self.eng.pos != 0:
-                    act = self.eng.on_price(px)
-                    if act == "EXIT":
-                        log("触发移动止损 @ %.1f (stop=%.1f) 持仓%.1f%%" % (
-                            px, self.eng.stop_level(),
-                            (px - self.eng.entry_px) / self.eng.entry_px * 100 * self.eng.pos))
-                        self.close_position(px)
+                    handled = False
+                    # 交易所侧是否已被保护止损平掉?
+                    if not self.dry and self.inst_type == "SWAP":
+                        live = [p for p in self.client.positions(self.inst)
+                                if abs(float(p.get("pos", 0))) > 0]
+                        if not live:
+                            log("交易所侧已平仓(保护止损触发?)")
+                            self.client.cancel_algo(self.inst, self.stop_algo)
+                            self.mailer.send("[OKX] 交易所侧止损触发",
+                                             "价格=%.1f\n时间=%s UTC" % (
+                                                 px, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
+                            self.stop_algo = None; self.stop_trigger = None; self.pos_sz = 0.0
+                            self.eng.flat()
+                            self.save_state()
+                            handled = True
+                    if not handled:
+                        act = self.eng.on_price(px)
+                        if act == "EXIT":
+                            log("触发移动止损 @ %.1f (stop=%.1f) 持仓%.1f%%" % (
+                                px, self.eng.stop_level(),
+                                (px - self.eng.entry_px) / self.eng.entry_px * 100 * self.eng.pos))
+                            self.close_position(px)
+                        else:
+                            self.sync_protective_stop()
                 else:
                     log("等待信号 | 价 %.1f | ATR %.2f | bar %s" % (
                         px, self.eng.atr() or 0,
                         datetime.datetime.utcfromtimestamp(self.last_bar_ts / 1000).strftime("%H:%M")))
+                self.save_state()
             except OKXError as e:
                 log("接口错误: %s" % e)
             time.sleep(self.cfg["poll_sec"])

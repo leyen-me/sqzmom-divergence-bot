@@ -5,7 +5,9 @@
 """
 import os, time, json, hmac, base64, hashlib, ssl, urllib.request, urllib.parse
 
-ssl._create_default_https_context = ssl._create_unverified_context
+# 默认开启证书校验; 仅在明确设置 OKX_INSECURE=1 时才跳过(便于某些代理环境)
+if os.environ.get("OKX_INSECURE") == "1":
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 BASE = os.environ.get("OKX_BASE", "https://www.okx.com")
 
@@ -96,6 +98,11 @@ class OKXClient:
             p["after"] = after
         return self._request("GET", "/api/v5/market/history-candles", p)
 
+    def candles_recent(self, inst_id, bar, limit=30):
+        """最近 K 线(含未收盘那根), 用于主循环轮询, 比 history-candles 轻。"""
+        return self._request("GET", "/api/v5/market/candles",
+                             {"instId": inst_id, "bar": bar, "limit": limit})
+
     def ticker(self, inst_id):
         return self._request("GET", "/api/v5/market/ticker", {"instId": inst_id})
 
@@ -162,6 +169,33 @@ class OKXClient:
 
     def pending_orders(self, inst_id):
         return self._request("GET", "/api/v5/trade/orders-pending", {"instId": inst_id}, signed=True)
+
+    # ---------- 算法单(交易所侧保护性止损) ----------
+    def place_algo_stop(self, inst_id, side, pos_side, sz, trigger_px, td_mode="cross"):
+        """挂条件止损单(slOrdPx=-1 市价成交)。返回 algoId。"""
+        body = {"instId": inst_id, "tdMode": td_mode, "side": side, "ordType": "conditional",
+                "sz": str(sz), "slTriggerPx": str(trigger_px), "slOrdPx": "-1",
+                "reduceOnly": "true"}
+        if pos_side:
+            body["posSide"] = pos_side
+        data = self._request("POST", "/api/v5/trade/order-algo", body=body, signed=True, retry=False)
+        r = data[0]
+        if r.get("sCode") not in (None, "0", ""):
+            raise OKXError("挂止损被拒 sCode=%s %s" % (r.get("sCode"), r.get("sMsg")))
+        return r.get("algoId")
+
+    def cancel_algo(self, inst_id, algo_id):
+        if not algo_id:
+            return
+        try:
+            self._request("POST", "/api/v5/trade/cancel-algos",
+                          body=[{"instId": inst_id, "algoId": algo_id}], signed=True, retry=False)
+        except OKXError:
+            pass
+
+    def algo_pending(self, inst_id, ord_type="conditional"):
+        return self._request("GET", "/api/v5/trade/orders-algo-pending",
+                             {"instId": inst_id, "ordType": ord_type}, signed=True)
 
     def account_config(self):
         return self._request("GET", "/api/v5/account/config", signed=True)[0]
