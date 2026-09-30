@@ -1,0 +1,13 @@
+__pycache__
+*.pyc
+.pytest_cache
+.git
+.gitignore
+.venv
+.env
+data
+out
+tv
+research
+.DS_Store
+*.log

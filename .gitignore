@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# 密钥 / 本地环境
+.env
+.env.local
+
+# 行情数据(可由 research/fetch_klines.py 重新拉取, 体积大)
+data/
+*.parquet
+
+# 运行产出 / 日志
+out/
+*.log
+
+# 系统
+.DS_Store
+
+# 保留 tv/ 下的 .pine 源码与 TV 导出记录

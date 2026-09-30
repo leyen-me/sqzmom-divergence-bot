@@ -1,0 +1,296 @@
+"""SQZMOM 背离波段 —— OKX 实盘/模拟盘交易程序。
+
+运行:
+    python3 trader.py                 # 用 config.json, 默认 dry_run(不下单)
+    DRY_RUN=0 python3 trader.py       # 实盘下单(demo 盘由 OKX_DEMO 控制)
+    OKX_DEMO=1 python3 trader.py      # OKX 模拟盘(需 demo 的 API key)
+
+密钥(实盘/模拟盘)从环境变量读取:
+    OKX_API_KEY / OKX_API_SECRET / OKX_API_PASSPHRASE / OKX_DEMO
+"""
+import os, sys, json, time, math, datetime, csv
+
+from okx_client import OKXClient, OKXError
+from strategy import StrategyEngine, Bar
+from mailer import Mailer
+
+ROOT = os.path.dirname(os.path.abspath(__file__))           # live/
+PROJ = os.path.dirname(ROOT)                                 # 项目根
+LOG = os.path.join(PROJ, "out", "trader.log")
+
+
+def log(msg):
+    line = time.strftime("%Y-%m-%d %H:%M:%S ") + msg
+    print(line, flush=True)
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write(line + "\n")
+
+
+def load_config():
+    with open(os.path.join(ROOT, "config.json")) as f:
+        cfg = json.load(f)
+    # 环境变量覆盖(方便容器部署)
+    if os.environ.get("DRY_RUN") is not None:
+        cfg["dry_run"] = os.environ["DRY_RUN"] == "1"
+    if os.environ.get("OKX_INSTID"):
+        cfg["instId"] = os.environ["OKX_INSTID"]
+    if os.environ.get("OKX_LEVERAGE"):
+        cfg["leverage"] = float(os.environ["OKX_LEVERAGE"])
+    if os.environ.get("OKX_QTY_PCT"):
+        cfg["qty_pct"] = float(os.environ["OKX_QTY_PCT"])
+    return cfg
+
+
+def fetch_history(client, inst_id, bar, need):
+    """取最近 need 根已收盘 K 线, 升序返回 [Bar]."""
+    raw = []
+    after = None
+    while len(raw) < need:
+        d = client.candles(inst_id, bar, limit=300, after=after)
+        if not d:
+            break
+        raw.extend(d)
+        after = d[-1][0]
+        if len(d) < 300:
+            break
+    raw = raw[::-1]  # 升序
+    bars = [Bar(int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])) for r in raw]
+    return bars
+
+
+def aggregate(bars_5m, tf_min=10):
+    """把 5m 聚合成 tf_min 的 K 线, 返回 [(bar, closed_bool)]。"""
+    ms = tf_min * 60 * 1000
+    out = {}
+    order = []
+    for b in bars_5m:
+        bucket = b.ts // ms * ms
+        if bucket not in out:
+            out[bucket] = Bar(bucket, b.open, b.high, b.low, b.close, b.vol)
+            order.append(bucket)
+        else:
+            c = out[bucket]
+            c.high = max(c.high, b.high); c.low = min(c.low, b.low)
+            c.close = b.close; c.vol += b.vol
+    order.sort()
+    res = []
+    now_ms = time.time() * 1000
+    for i, ts in enumerate(order):
+        closed = (now_ms >= ts + ms)
+        res.append((out[ts], closed))
+    return res
+
+
+class Trader:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.client = OKXClient()
+        self.eng = StrategyEngine(
+            length_kc=cfg["length_kc"], lb=cfg["lb"], atr_len=cfg["atr_len"],
+            sl_atr=cfg["sl_atr"], trail_atr=cfg["trail_atr"])
+        self.inst = cfg["instId"]
+        self.inst_type = "SWAP" if self.inst.endswith("-SWAP") else "SPOT"
+        self.dry = cfg["dry_run"]
+        self.last_bar_ts = 0
+        self.sim_pos = 0.0      # dry-run 持仓数量
+        self.sim_entry = 0.0
+        self.inst_info = None
+        self.entry_order_id = None
+        self.mailer = Mailer(log=log)
+        self._trades = []          # 当日/运行期成交记录
+        self._summary_sent = None
+
+    # ---------- 工具 ----------
+    def price(self):
+        return float(self.client.ticker(self.inst)[0]["last"])
+
+    def equity(self):
+        if self.dry:
+            return self.cfg.get("_sim_equity", 10000.0)
+        return self.client.balance_usdt()
+
+    def size_contracts(self, price):
+        info = self.inst_info
+        ctval = float(info["ctVal"])
+        lot = float(info["lotSz"])
+        min_sz = float(info["minSz"])
+        notional = self.equity() * self.cfg["qty_pct"] * self.cfg["leverage"]
+        raw = notional / (ctval * price)
+        sz = math.floor(raw / lot) * lot
+        if sz < min_sz:
+            sz = 0.0
+        return round(sz, 8)
+
+    def spot_size(self, price):
+        notional = self.equity() * self.cfg["qty_pct"]
+        return round(notional / price, 8)
+
+    # ---------- 下单 ----------
+    def open_position(self, signal, price):
+        if self.dry:
+            sz = (self.spot_size(price) if self.inst_type == "SPOT" else self.size_contracts(price))
+            if sz <= 0:
+                log("[dry] 仓位算出来是 0, 跳过")
+                return
+            self.sim_pos = sz if signal == "L" else -sz
+            self.sim_entry = price
+            self.eng.enter(signal, price)
+            log("[dry] 开仓 %s @ %.1f sz=%s atrRef=%.2f stop=%.1f" %
+                (signal, price, sz, self.eng.atr_ref, self.eng.stop_level()))
+            self.notify_entry(signal, price, sz)
+            return
+        try:
+            if self.inst_type == "SPOT":
+                if signal != "L":
+                    log("现货不支持做空, 忽略 S 信号")
+                    return
+                sz = self.spot_size(price)
+                r = self.client.place_order(self.inst, "buy", "limit", sz,
+                                            td_mode="cash", px=price)
+            else:
+                sz = self.size_contracts(price)
+                if sz <= 0:
+                    log("仓位算出来是 0(资金不足/低于最小张数), 跳过")
+                    return
+                side = "buy" if signal == "L" else "sell"
+                r = self.client.place_order(self.inst, side, "limit", sz,
+                                            td_mode=self.cfg["td_mode"], px=price)
+            log("[live] 开仓 %s @ %.1f sz=%s -> %s" % (signal, price, sz, r))
+            self.eng.enter(signal, price)
+            self.notify_entry(signal, price, sz)
+        except OKXError as e:
+            log("开仓失败: %s" % e)
+            self.mailer.send("[OKX][异常] 开仓失败", "%s\n价格=%.1f\n%s" % (signal, price, e))
+
+    def notify_entry(self, signal, price, sz):
+        side = "做多 LONG" if signal == "L" else "做空 SHORT"
+        stop = self.eng.stop_level()
+        self._open_info = {"signal": signal, "entry": price, "sz": sz,
+                           "atr": self.eng.atr_ref, "stop": stop,
+                           "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self.mailer.send(
+            "[OKX] 开仓 %s @ %.1f" % (side, price),
+            "%s\n合约/标的: %s\n数量: %s\n入场价: %.1f\n初始止损: %.1f (ATR=%.2f)\n"
+            "模式: %s | 杠杆: %s\n时间: %s UTC" % (
+                side, self.inst, sz, price, stop or 0, self.eng.atr_ref or 0,
+                "模拟盘" if self.dry else "实盘", self.cfg["leverage"],
+                time.strftime("%Y-%m-%d %H:%M:%S")))
+
+    def notify_exit(self, price, reason):
+        info = getattr(self, "_open_info", None) or {}
+        entry = info.get("entry") or self.eng.entry_px
+        chg = (price - entry) / entry * 100 * (1 if info.get("signal", "L") == "L" else -1) if entry else 0
+        self._trades.append({"signal": info.get("signal"), "entry": entry,
+                             "exit": price, "chg": chg, "reason": reason})
+        self.mailer.send(
+            "[OKX] 平仓(%s) @ %.1f" % (reason, price),
+            "标的: %s\n入场: %.1f -> 出场: %.1f (%+.2f%%)\n止损原因: %s\n"
+            "模式: %s\n时间: %s UTC" % (
+                self.inst, entry, price, chg, reason,
+                "模拟盘" if self.dry else "实盘", time.strftime("%Y-%m-%d %H:%M:%S")))
+        self._open_info = None
+
+    def close_position(self, price):
+        if self.dry:
+            log("[dry] 平仓 @ %.1f  (盈亏 %.2f%%) -> 权益 %.2f" % (
+                price, (price - self.sim_entry) / self.sim_entry * 100 * (1 if self.sim_pos > 0 else -1),
+                self.equity()))
+            self.notify_exit(price, "移动止损")
+            self.sim_pos = 0.0
+            self.eng.flat()
+            return
+        try:
+            pos = self.client.positions(self.inst)
+            live = [p for p in pos if abs(float(p.get("pos", 0))) > 0]
+            for p in live:
+                side_p = float(p["pos"])
+                close_side = "sell" if side_p > 0 else "buy"
+                r = self.client.place_order(self.inst, close_side, "market", abs(side_p),
+                                            td_mode=self.cfg["td_mode"], reduce_only=True)
+                log("[live] 平仓 sz=%s -> %s" % (abs(side_p), r))
+            self.notify_exit(price, "移动止损")
+            self.eng.flat()
+        except OKXError as e:
+            log("平仓失败: %s" % e)
+            self.mailer.send("[OKX][紧急] 平仓失败, 请人工处理",
+                             "价格=%.1f\n%s\n当前持仓可能未平!" % (price, e))
+
+    # ---------- 主循环 ----------
+    def warmup(self):
+        if self.inst_type == "SWAP":
+            self.inst_info = self.client.instrument("SWAP", self.inst)
+        need = self.cfg["warmup_bars"] * 2  # 10m -> 5m
+        bars5 = fetch_history(self.client, self.inst, self.cfg["bar"], need)
+        agg = aggregate(bars5, self.cfg["tf_min"])
+        fed = 0
+        for b, closed in agg[:-1]:
+            if closed:
+                self.eng.on_bar(b)
+                self.last_bar_ts = b.ts
+                fed += 1
+        log("warmup: 喂入 %d 根 %dm K线, 当前价 %.1f, ATR=%.2f" %
+            (fed, self.cfg["tf_min"], self.price(), self.eng.atr() or 0))
+
+    def loop(self):
+        log("启动 trader | inst=%s demo=%s dry_run=%s lev=%s qty=%s" %
+            (self.inst, self.client.demo, self.dry, self.cfg["leverage"], self.cfg["qty_pct"]))
+        self.warmup()
+        self.mailer.send(
+            "[OKX] 交易程序启动",
+            "标的: %s\n模式: %s | 杠杆: %s | 仓位: %s%%\n参数: KC=%s lb=%s ATR=%s SL=%sATR Trail=%sATR\n时间: %s UTC" % (
+                self.inst, "模拟盘" if self.dry else "实盘", self.cfg["leverage"],
+                self.cfg["qty_pct"] * 100, self.cfg["length_kc"], self.cfg["lb"],
+                self.cfg["atr_len"], self.cfg["sl_atr"], self.cfg["trail_atr"],
+                time.strftime("%Y-%m-%d %H:%M:%S")))
+        max_iter = int(os.environ.get("MAX_ITER", "0")) or None
+        it = 0
+        while True:
+            it += 1
+            if max_iter and it > max_iter:
+                log("达到 MAX_ITER=%d, 退出" % max_iter)
+                break
+            try:
+                bars5 = fetch_history(self.client, self.inst, self.cfg["bar"], 60)
+                agg = aggregate(bars5, self.cfg["tf_min"])
+                # 只处理已收盘且未处理过的 bar
+                for b, closed in agg:
+                    if not closed or b.ts <= self.last_bar_ts:
+                        continue
+                    self.last_bar_ts = b.ts
+                    sig = self.eng.on_bar(b)
+                    if sig:
+                        log("信号 %s @ bar %s close=%.1f" % (
+                            sig, datetime.datetime.utcfromtimestamp(b.ts / 1000), b.close))
+                        if self.eng.pos == 0:
+                            self.open_position(sig, self.price())
+                # 盘中止损检查
+                px = self.price()
+                if self.eng.pos != 0:
+                    act = self.eng.on_price(px)
+                    if act == "EXIT":
+                        log("触发移动止损 @ %.1f (stop=%.1f) 持仓%.1f%%" % (
+                            px, self.eng.stop_level(),
+                            (px - self.eng.entry_px) / self.eng.entry_px * 100 * self.eng.pos))
+                        self.close_position(px)
+                else:
+                    log("等待信号 | 价 %.1f | ATR %.2f | bar %s" % (
+                        px, self.eng.atr() or 0,
+                        datetime.datetime.utcfromtimestamp(self.last_bar_ts / 1000).strftime("%H:%M")))
+            except OKXError as e:
+                log("接口错误: %s" % e)
+            time.sleep(self.cfg["poll_sec"])
+
+
+if __name__ == "__main__":
+    cfg = load_config()
+    t = Trader(cfg)
+    try:
+        t.loop()
+    except KeyboardInterrupt:
+        log("手动停止")
+        t.mailer.send("[OKX] 交易程序已手动停止", "时间: %s UTC" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception as e:
+        log("致命错误: %r" % e)
+        t.mailer.send("[OKX][致命] 交易程序崩溃退出", "%r\n时间: %s UTC" % (e, time.strftime("%Y-%m-%d %H:%M:%S")))
+        raise
