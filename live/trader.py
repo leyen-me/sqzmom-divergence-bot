@@ -114,6 +114,8 @@ class Trader:
         self.exit_mode = cfg.get("exit_mode", "local")   # local=内存移动止损 / exchange=交易所原生
         self.use_ws = cfg.get("use_ws", False)           # 用 WebSocket 行情(带 REST 兜底)
         self.feed = None
+        # 虚拟权益: 用它模拟"真实本金"(如 1000 刀), 忽略模拟账户的大额余额
+        self.virtual_equity = float(cfg["account_equity_usdt"]) if cfg.get("account_equity_usdt") else None
 
     # ---------- 状态落盘 ----------
     def load_state(self):
@@ -122,6 +124,14 @@ class Trader:
                 return json.load(f)
         except Exception:
             return {}
+
+    def _restore_equity(self):
+        if self.virtual_equity is None:
+            return
+        s = self.load_state()
+        if "virtual_equity" in s and s["virtual_equity"] is not None:
+            self.virtual_equity = float(s["virtual_equity"])
+            log("恢复虚拟权益: %.2f USDT" % self.virtual_equity)
 
     def save_state(self):
         st = {
@@ -135,6 +145,7 @@ class Trader:
             "trail_algo": self.trail_algo,
             "stop_trigger": self.stop_trigger,
             "pos_sz": self.pos_sz,
+            "virtual_equity": self.virtual_equity,
         }
         try:
             os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
@@ -150,9 +161,22 @@ class Trader:
         return float(self.client.ticker(self.inst)[0]["last"])
 
     def equity(self):
+        ve = getattr(self, "virtual_equity", None)
+        if ve is not None:
+            return ve
         if self.dry:
             return self.cfg.get("_sim_equity", 10000.0)
         return self.client.balance_usdt()
+
+    def _apply_pnl(self, dirn, entry, exit_px, sz):
+        """按虚拟权益记账(模拟真实本金曲线)。"""
+        if self.virtual_equity is None:
+            return
+        ctval = float(self.inst_info["ctVal"]) if self.inst_info else 1.0
+        pnl = (exit_px - entry) * dirn * sz * ctval
+        fee = (entry + exit_px) * sz * ctval * self.cfg.get("fee_rate", 0.0005)
+        self.virtual_equity += pnl - fee
+        log("虚拟权益 %+.2f -> %.2f USDT" % (pnl - fee, self.virtual_equity))
 
     def size_contracts(self, price):
         info = self.inst_info
@@ -358,13 +382,17 @@ class Trader:
         self._open_info = None
 
     def close_position(self, price):
+        if self.eng.pos == 0 and self.sim_pos == 0.0:
+            return
         if self.dry:
+            dirn = 1 if self.sim_pos > 0 else -1
+            self._apply_pnl(dirn, self.sim_entry, price, abs(self.sim_pos))
             log("[dry] 平仓 @ %.1f  (盈亏 %.2f%%) -> 权益 %.2f" % (
-                price, (price - self.sim_entry) / self.sim_entry * 100 * (1 if self.sim_pos > 0 else -1),
-                self.equity()))
+                price, (price - self.sim_entry) / self.sim_entry * 100 * dirn, self.equity()))
             self.notify_exit(price, "移动止损")
             self.sim_pos = 0.0
             self.eng.flat()
+            self.save_state()
             return
         # 先撤交易所侧挂单(硬止损 + 移动止损), 避免残留/重复触发
         self.client.cancel_algo(self.inst, self.stop_algo)
@@ -403,6 +431,7 @@ class Trader:
                 o = self.client.order_status(self.inst, oid)
                 if o and float(o.get("avgPx") or 0) > 0:
                     exit_px = float(o["avgPx"])
+            self._apply_pnl(self.eng.pos, self.eng.entry_px, exit_px, self.pos_sz)
             self.pos_sz = 0.0
             self.notify_exit(exit_px, "移动止损")
             self.eng.flat()
@@ -526,6 +555,9 @@ class Trader:
             self.feed.start()
             log("WebSocket 行情已启动(带 REST 兜底)")
         self.warmup()
+        self._restore_equity()
+        if self.virtual_equity is not None:
+            log("虚拟权益模式: 按 %.2f USDT 计算仓位(忽略模拟账户余额)" % self.virtual_equity)
         self.mailer.send(
             "[OKX] 交易程序启动",
             "标的: %s\n模式: %s | 杠杆: %s | 仓位: %s%%\n参数: KC=%s lb=%s ATR=%s SL=%sATR Trail=%sATR\n时间: %s UTC" % (
@@ -559,6 +591,7 @@ class Trader:
                             self.client.cancel_algo(self.inst, self.stop_algo)
                             self.client.cancel_algo(self.inst, self.trail_algo)
                             exit_px = self._last_fill_px() or px
+                            self._apply_pnl(self.eng.pos, self.eng.entry_px, exit_px, self.pos_sz)
                             self.stop_algo = None; self.trail_algo = None
                             self.stop_trigger = None; self.pos_sz = 0.0
                             self.notify_exit(exit_px, "交易所止损")

@@ -47,6 +47,7 @@ class TestPositionSizing(unittest.TestCase):
     def _trader(self, equity=10000.0):
         t = T.Trader.__new__(T.Trader)          # 跳过 __init__(避免建 client/ mailer)
         t.cfg = {"qty_pct": 0.8, "leverage": 3, "_sim_equity": equity}
+        t.virtual_equity = None
         t.dry = True
         t.inst_type = "SWAP"
         t.inst_info = {"ctVal": "0.01", "lotSz": "0.01", "minSz": "0.01"}
@@ -65,6 +66,32 @@ class TestPositionSizing(unittest.TestCase):
     def test_spot_size(self):
         t = self._trader()
         self.assertAlmostEqual(t.spot_size(50000), 10000 * 0.8 / 50000, places=8)
+
+    def test_virtual_equity_overrides_balance(self):
+        # 模拟账户有 10000, 但虚拟权益设 1000 -> 按 1000 算: 1000*0.8*3/500=4.8
+        t = self._trader(equity=10000)
+        t.virtual_equity = 1000.0
+        self.assertAlmostEqual(t.size_contracts(50000), 4.8, places=8)
+
+
+class TestVirtualEquity(unittest.TestCase):
+    def test_apply_pnl_long(self):
+        t = T.Trader.__new__(T.Trader)
+        t.virtual_equity = 1000.0
+        t.inst_info = {"ctVal": "0.01"}
+        t.cfg = {"fee_rate": 0.0}
+        # 1 张 = 0.01 BTC; 价格 +100 -> pnl = 100*0.01*1 = 1
+        t._apply_pnl(1, 50000, 50100, 1)
+        self.assertAlmostEqual(t.virtual_equity, 1001.0, places=8)
+
+    def test_apply_pnl_short_with_fee(self):
+        t = T.Trader.__new__(T.Trader)
+        t.virtual_equity = 1000.0
+        t.inst_info = {"ctVal": "0.01"}
+        t.cfg = {"fee_rate": 0.0}
+        # 做空, 价格 -50 -> pnl = 50*0.01*2 = 1
+        t._apply_pnl(-1, 50000, 49950, 2)
+        self.assertAlmostEqual(t.virtual_equity, 1001.0, places=8)
 
 
 class TestFetchHistory(unittest.TestCase):
