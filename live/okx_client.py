@@ -184,6 +184,24 @@ class OKXClient:
             raise OKXError("挂止损被拒 sCode=%s %s" % (r.get("sCode"), r.get("sMsg")))
         return r.get("algoId")
 
+    def place_trailing_stop(self, inst_id, side, pos_side, sz, callback_spread,
+                            active_px, td_mode="cross"):
+        """挂 OKX 原生移动止损单(move_order_stop)。返回 algoId。"""
+        body = {"instId": inst_id, "tdMode": td_mode, "side": side, "ordType": "move_order_stop",
+                "sz": str(sz), "callbackSpread": str(callback_spread),
+                "activePx": str(active_px), "reduceOnly": "true"}
+        if pos_side:
+            body["posSide"] = pos_side
+        data = self._request("POST", "/api/v5/trade/order-algo", body=body, signed=True, retry=False)
+        r = data[0]
+        if r.get("sCode") not in (None, "0", ""):
+            raise OKXError("挂移动止损被拒 sCode=%s %s" % (r.get("sCode"), r.get("sMsg")))
+        return r.get("algoId")
+
+    def fills(self, inst_id, limit=20):
+        return self._request("GET", "/api/v5/trade/fills",
+                             {"instId": inst_id, "limit": limit}, signed=True)
+
     def cancel_algo(self, inst_id, algo_id):
         if not algo_id:
             return
@@ -196,6 +214,16 @@ class OKXClient:
     def algo_pending(self, inst_id, ord_type="conditional"):
         return self._request("GET", "/api/v5/trade/orders-algo-pending",
                              {"instId": inst_id, "ordType": ord_type}, signed=True)
+
+    def algo_pending_all(self, inst_id):
+        out = []
+        for t in ("conditional", "move_order_stop"):
+            try:
+                out += self._request("GET", "/api/v5/trade/orders-algo-pending",
+                                     {"instId": inst_id, "ordType": t}, signed=True)
+            except OKXError:
+                pass
+        return out
 
     def account_config(self):
         return self._request("GET", "/api/v5/account/config", signed=True)[0]

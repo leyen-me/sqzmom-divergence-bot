@@ -13,6 +13,7 @@ import os, sys, json, time, math, datetime, csv
 from okx_client import OKXClient, OKXError
 from strategy import StrategyEngine, Bar
 from mailer import Mailer
+from ws import OKXFeed
 
 ROOT = os.path.dirname(os.path.abspath(__file__))           # live/
 PROJ = os.path.dirname(ROOT)                                 # 项目根
@@ -107,8 +108,12 @@ class Trader:
         self._summary_sent = None
         self.state_path = os.path.join(PROJ, "out", "state.json")
         self.stop_algo = None       # 交易所侧保护性止损 algoId
+        self.trail_algo = None      # 交易所侧原生移动止损 algoId(exchange 模式)
         self.stop_trigger = None    # 交易所侧止损当前触发价
         self.pos_sz = 0.0           # 当前持仓数量(用于保护止损)
+        self.exit_mode = cfg.get("exit_mode", "local")   # local=内存移动止损 / exchange=交易所原生
+        self.use_ws = cfg.get("use_ws", False)           # 用 WebSocket 行情(带 REST 兜底)
+        self.feed = None
 
     # ---------- 状态落盘 ----------
     def load_state(self):
@@ -127,6 +132,9 @@ class Trader:
             "best": self.eng.best,
             "trail_on": self.eng.trail_on,
             "stop_algo": self.stop_algo,
+            "trail_algo": self.trail_algo,
+            "stop_trigger": self.stop_trigger,
+            "pos_sz": self.pos_sz,
         }
         try:
             os.makedirs(os.path.dirname(self.state_path), exist_ok=True)
@@ -237,26 +245,80 @@ class Trader:
         tick = float(self.inst_info["tickSz"]) if self.inst_info else 0.1
         return round(px / tick) * tick
 
-    def place_protective_stop(self):
-        """开仓后在交易所挂硬止损条件单, 防止程序离线时裸奔。"""
-        if self.dry or self.inst_type != "SWAP" or self.eng.pos == 0 or self.pos_sz <= 0:
-            return
-        trig = self._round_tick(self.eng.stop_level())
+    def _last_fill_px(self):
+        try:
+            fl = self.client.fills(self.inst, limit=1)
+            if fl:
+                return float(fl[0]["fillPx"])
+        except (OKXError, KeyError, ValueError):
+            pass
+        return None
+
+    def _place_hard_stop(self):
         side = "sell" if self.eng.pos > 0 else "buy"
         pos_side = ("long" if self.eng.pos > 0 else "short") if self.hedge else None
+        trig = self._round_tick(self.eng.stop_level())
         try:
             self.stop_algo = self.client.place_algo_stop(
                 self.inst, side, pos_side, self.pos_sz, trig, self.cfg["td_mode"])
             self.stop_trigger = trig
             log("[live] 已挂交易所保护止损 @ %.1f algoId=%s" % (trig, self.stop_algo))
         except OKXError as e:
+            self.stop_algo = None
             log("挂保护止损失败: %s" % e)
             self.mailer.send("[OKX][异常] 交易所保护止损挂单失败",
                              "止损价=%.1f 数量=%s\n%s\n仓位未受交易所侧保护!" % (trig, self.pos_sz, e))
 
-    def sync_protective_stop(self):
-        """移动止损激活后, 把交易所侧止损同步上移(差额 > 0.1ATR 才重挂)。"""
+    def _place_trailing(self):
+        side = "sell" if self.eng.pos > 0 else "buy"
+        pos_side = ("long" if self.eng.pos > 0 else "short") if self.hedge else None
+        off = self._round_tick(self.cfg["trail_atr"] * self.eng.atr_ref)
+        act = self._round_tick(self.eng.entry_px + self.eng.pos * self.cfg["trail_atr"] * self.eng.atr_ref)
+        try:
+            self.trail_algo = self.client.place_trailing_stop(
+                self.inst, side, pos_side, self.pos_sz, off, act, self.cfg["td_mode"])
+            log("[live] 已挂交易所原生移动止损 激活价=%.1f 回撤=%.1f algoId=%s" % (
+                act, off, self.trail_algo))
+        except OKXError as e:
+            self.trail_algo = None
+            log("挂移动止损失败: %s" % e)
+            self.mailer.send("[OKX][异常] 交易所移动止损挂单失败",
+                             "激活价=%.1f 回撤=%.1f\n%s" % (act, off, e))
+
+    def ensure_protective_stops(self):
+        """核对交易所挂单: 撤孤儿、补齐缺失(可安全重复调用, 不会重复挂单)。"""
         if self.dry or self.inst_type != "SWAP" or self.eng.pos == 0 or self.pos_sz <= 0:
+            return
+        try:
+            pend = self.client.algo_pending_all(self.inst)
+        except OKXError as e:
+            log("查询挂单失败: %s" % e)
+            return
+        ids = {a.get("algoId") for a in pend}
+        for a in pend:
+            if a.get("algoId") not in (self.stop_algo, self.trail_algo):
+                self.client.cancel_algo(self.inst, a.get("algoId"))
+        if not (self.stop_algo and self.stop_algo in ids):
+            self.stop_algo = None
+            self._place_hard_stop()
+        if self.exit_mode == "exchange" and not (self.trail_algo and self.trail_algo in ids):
+            self.trail_algo = None
+            self._place_trailing()
+
+    def place_protective_stop(self):
+        """开仓后确保交易所侧保护单到位(硬止损 + exchange 模式的原生移动止损)。"""
+        self.stop_algo = None
+        self.trail_algo = None
+        self.ensure_protective_stops()
+
+    def sync_protective_stop(self):
+        """local 模式: 移动止损激活后把交易所侧硬止损同步上移( >0.1ATR 才重挂)。
+
+        exchange 模式: 移动止损由交易所原生单执行, 硬止损保持 -2ATR 不动。
+        """
+        if self.dry or self.inst_type != "SWAP" or self.eng.pos == 0 or self.pos_sz <= 0:
+            return
+        if self.exit_mode != "local":
             return
         if not self.eng.trail_on:
             return
@@ -304,9 +366,10 @@ class Trader:
             self.sim_pos = 0.0
             self.eng.flat()
             return
-        # 先撤交易所侧保护止损, 避免残留/重复触发
+        # 先撤交易所侧挂单(硬止损 + 移动止损), 避免残留/重复触发
         self.client.cancel_algo(self.inst, self.stop_algo)
-        self.stop_algo = None; self.stop_trigger = None
+        self.client.cancel_algo(self.inst, self.trail_algo)
+        self.stop_algo = None; self.stop_trigger = None; self.trail_algo = None
         try:
             live = [p for p in self.client.positions(self.inst) if abs(float(p.get("pos", 0))) > 0]
             close_oids = []
@@ -390,7 +453,14 @@ class Trader:
             else:
                 log("启动核对: 当前无持仓")
             self.eng.flat()
-            self.stop_algo = None
+            # 清理可能残留的算法单
+            try:
+                for a in self.client.algo_pending_all(self.inst):
+                    self.client.cancel_algo(self.inst, a.get("algoId"))
+            except OKXError:
+                pass
+            self.stop_algo = None; self.trail_algo = None
+            self.stop_trigger = None; self.pos_sz = 0.0
             self.save_state()
             return
         p = live[0]
@@ -406,6 +476,8 @@ class Trader:
             self.eng.best = saved["best"]
             self.eng.trail_on = saved["trail_on"]
             self.stop_algo = saved.get("stop_algo")
+            self.trail_algo = saved.get("trail_algo")
+            self.stop_trigger = saved.get("stop_trigger")
             log("启动核对: 按落盘状态恢复持仓 %+d 数量=%s (entry=%.1f best=%.1f trail=%s)" % (
                 sig, q, self.eng.entry_px, self.eng.best, self.eng.trail_on))
         else:
@@ -415,12 +487,44 @@ class Trader:
                          "方向=%+d 数量=%s 均价=%.1f\nATR=%.2f best=%.1f trail_on=%s\n时间=%s UTC" % (
                              sig, q, entry, self.eng.atr_ref, self.eng.best, self.eng.trail_on,
                              time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
-        self.place_protective_stop()
+        self.ensure_protective_stops()
         self.save_state()
+
+    def _feed_bars(self):
+        """喂入新收盘 K 线并返回当前价。优先 WebSocket, 失效时回退 REST。"""
+        if self.use_ws and self.feed and not self.feed.stale(20):
+            for (ts, o, h, l, c) in self.feed.drain_closed():
+                if ts <= self.last_bar_ts:
+                    continue
+                self.last_bar_ts = ts
+                sig = self.eng.on_bar(Bar(ts, o, h, l, c))
+                if sig:
+                    log("信号 %s @ bar %s close=%.1f" % (
+                        sig, datetime.datetime.utcfromtimestamp(ts / 1000), c))
+                    if self.eng.pos == 0:
+                        self.open_position(sig, self.feed.price or self.price())
+            return self.feed.price or self.price()
+        raw = fetch_recent(self.client, self.inst, self.cfg["bar"], 30)
+        agg = aggregate(raw, self.cfg["tf_min"])
+        for b, closed in agg:
+            if not closed or b.ts <= self.last_bar_ts:
+                continue
+            self.last_bar_ts = b.ts
+            sig = self.eng.on_bar(b)
+            if sig:
+                log("信号 %s @ bar %s close=%.1f" % (
+                    sig, datetime.datetime.utcfromtimestamp(b.ts / 1000), b.close))
+                if self.eng.pos == 0:
+                    self.open_position(sig, self.price())
+        return self.price()
 
     def loop(self):
         log("启动 trader | inst=%s demo=%s dry_run=%s lev=%s qty=%s" %
             (self.inst, self.client.demo, self.dry, self.cfg["leverage"], self.cfg["qty_pct"]))
+        if self.use_ws:
+            self.feed = OKXFeed(self.inst, self.cfg["bar"])
+            self.feed.start()
+            log("WebSocket 行情已启动(带 REST 兜底)")
         self.warmup()
         self.mailer.send(
             "[OKX] 交易程序启动",
@@ -437,46 +541,39 @@ class Trader:
                 log("达到 MAX_ITER=%d, 退出" % max_iter)
                 break
             try:
-                raw = fetch_recent(self.client, self.inst, self.cfg["bar"], 30)
-                agg = aggregate(raw, self.cfg["tf_min"])
-                # 只处理已收盘且未处理过的 bar
-                for b, closed in agg:
-                    if not closed or b.ts <= self.last_bar_ts:
-                        continue
-                    self.last_bar_ts = b.ts
-                    sig = self.eng.on_bar(b)
-                    if sig:
-                        log("信号 %s @ bar %s close=%.1f" % (
-                            sig, datetime.datetime.utcfromtimestamp(b.ts / 1000), b.close))
-                        if self.eng.pos == 0:
-                            self.open_position(sig, self.price())
+                px = self._feed_bars()
                 # 盘中止损检查
-                px = self.price()
                 if self.eng.pos != 0:
-                    handled = False
-                    # 交易所侧是否已被保护止损平掉?
-                    if not self.dry and self.inst_type == "SWAP":
+                    if self.dry or self.inst_type != "SWAP":
+                        # 纯本地模拟: 内存移动止损驱动
+                        act = self.eng.on_price(px)
+                        if act == "EXIT":
+                            log("触发移动止损 @ %.1f (stop=%.1f)" % (px, self.eng.stop_level()))
+                            self.close_position(px)
+                    else:
                         live = [p for p in self.client.positions(self.inst)
                                 if abs(float(p.get("pos", 0))) > 0]
                         if not live:
-                            log("交易所侧已平仓(保护止损触发?)")
+                            # 交易所侧已平仓(硬止损或原生移动止损触发)
+                            log("交易所侧已平仓")
                             self.client.cancel_algo(self.inst, self.stop_algo)
-                            self.mailer.send("[OKX] 交易所侧止损触发",
-                                             "价格=%.1f\n时间=%s UTC" % (
-                                                 px, time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())))
-                            self.stop_algo = None; self.stop_trigger = None; self.pos_sz = 0.0
+                            self.client.cancel_algo(self.inst, self.trail_algo)
+                            exit_px = self._last_fill_px() or px
+                            self.stop_algo = None; self.trail_algo = None
+                            self.stop_trigger = None; self.pos_sz = 0.0
+                            self.notify_exit(exit_px, "交易所止损")
                             self.eng.flat()
                             self.save_state()
-                            handled = True
-                    if not handled:
-                        act = self.eng.on_price(px)
-                        if act == "EXIT":
-                            log("触发移动止损 @ %.1f (stop=%.1f) 持仓%.1f%%" % (
-                                px, self.eng.stop_level(),
-                                (px - self.eng.entry_px) / self.eng.entry_px * 100 * self.eng.pos))
-                            self.close_position(px)
+                        elif self.exit_mode == "local":
+                            act = self.eng.on_price(px)
+                            if act == "EXIT":
+                                log("触发移动止损 @ %.1f (stop=%.1f)" % (px, self.eng.stop_level()))
+                                self.close_position(px)
+                            else:
+                                self.sync_protective_stop()
                         else:
-                            self.sync_protective_stop()
+                            # exchange 模式: 出场交给交易所, 本地仅更新记录
+                            self.eng.on_price(px)
                 else:
                     log("等待信号 | 价 %.1f | ATR %.2f | bar %s" % (
                         px, self.eng.atr() or 0,

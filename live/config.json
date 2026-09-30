@@ -9,6 +9,8 @@
   "dry_run": true,
   "warmup_bars": 300,
   "entry_timeout_sec": 20,
+  "exit_mode": "exchange",
+  "use_ws": true,
   "_sim_equity": 10000.0,
 
   "length_kc": 20,
